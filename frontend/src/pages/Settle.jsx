@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 
-const surface_panel = true
 export default function Settle() {
   const [list, setList] = useState([])
   const [msg, setMsg] = useState('')
@@ -29,10 +28,11 @@ export default function Settle() {
     }
   }
   return (
-    <div className={surface_panel ? "page" : "page"}>
+    <div className="page">
       <h2>结算关账</h2>
       <p className="lead">
-        按锁定电价与累计电量关账，释放桩位与枪线。已中断会话保留冻结残额，由此处走一次收口。
+        按锁定电价与累计电量关账，释放桩位与枪线。已中断会话保留冻结残额，由此处走一次收口；
+        存在未清缺口的中断会话，收口冻结，须先在急停页做缺口对账。
       </p>
       <div className="panel">
         <table>
@@ -43,28 +43,41 @@ export default function Settle() {
               <th>状态</th>
               <th>电量</th>
               <th>金额</th>
+              <th>未清缺口</th>
               <th />
             </tr>
           </thead>
           <tbody>
-            {list.map((s) => (
-              <tr key={s.id}>
-                <td>{s.slip_no}</td>
-                <td>
-                  {s.site_name} · {s.pile_name}
-                </td>
-                <td>
-                  <span className={`tag ${s.status}`}>{s.status}</span>
-                </td>
-                <td>{s.kwh}</td>
-                <td>{s.amount}</td>
-                <td>
-                  <button type="button" className="primary" onClick={() => go(s)}>
-                    {s.status === '已中断' ? '收口残额' : '结算关账'}
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {list.map((s) => {
+              const frozen = s.status === '已中断' && (s.缺口数 ?? 0) > 0
+              return (
+                <tr key={s.id}>
+                  <td>{s.slip_no}</td>
+                  <td>
+                    {s.site_name} · {s.pile_name}
+                  </td>
+                  <td>
+                    <span className={`tag ${s.status}`}>{s.status}</span>
+                  </td>
+                  <td>{s.kwh}</td>
+                  <td>{s.amount}</td>
+                  <td style={{ color: frozen ? 'var(--danger)' : undefined }}>
+                    {s.status === '已中断' ? (s.缺口数 ?? 0) : '—'}
+                  </td>
+                  <td>
+                    <button
+                      type="button"
+                      className={frozen ? 'danger' : 'primary'}
+                      disabled={frozen}
+                      title={frozen ? '缺口未清，禁止收口' : ''}
+                      onClick={() => go(s)}
+                    >
+                      {frozen ? '收口冻结' : s.status === '已中断' ? '收口残额' : '结算关账'}
+                    </button>
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
         <p className={`msg ${msg.startsWith('已关账') ? 'ok' : ''}`}>{msg}</p>

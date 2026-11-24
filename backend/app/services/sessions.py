@@ -1,18 +1,20 @@
 from __future__ import annotations
-from app.services import abort_surface
 
 from fastapi import HTTPException
 
 from app.services.core import current_band_price, get_setting, is_day_sealed, now_str, today
 
-# 急停中断残额口径（全项目唯一口径）：方案 B —— 保留可结算残额。
+# 急停中断残额口径（全项目唯一口径）：方案 B —— 以残额钉枪缺口为准。
 #
+#   * 允许先改中断态字，但枪线/残额/脉冲证据不齐时必须写“可核缺口”（abort_gaps），
+#     并冻结急停宣称（回执 急停宣称=否），缺口未清前禁止收口；
 #   * 中断即冻结残额（电量/单价/金额），释放桩位与枪线，并落“异常中断”事件；
 #   * 冻结点一经写入不再改写，中断结局可逐项重放（见 abort_receipt）；
 #   * 允许对“已中断”会话走一次结算收口（settle），收口后转“已关账”；
-#   * 残额不得被静默清零：任何清零都必须有事件与可追的会话留痕。
+#   * 残额不得被静默清零：任何清零都必须有事件与可追的会话留痕，否则落缺口；
+#   * 所有写入口都在 BEGIN IMMEDIATE 事务内：中断半截即整笔回滚，不留“态字已改枪仍钉”。
 #
-# 本模块之外不得再实现第二套中断语义。
+# 本模块之外不得再实现第二套中断语义，禁止旁路改中断态字/总览快照。
 
 # 可被急停中断的状态
 ABORTABLE = ("充电中", "结算中", "已超时")
@@ -23,6 +25,13 @@ OPEN_STATUSES = ("充电中", "结算中")
 
 EPS_KWH = 0.0005
 EPS_AMOUNT = 0.005
+
+# 缺口类型（可核、可回放、可逐条核销）
+GAP_OCCUPANCY = "枪线未释放"
+GAP_ZEROED = "残额静默清零"
+GAP_DRIFT = "脉冲电量漂移"
+GAP_HALF_STATE = "中断态半截"
+GAP_TYPES = (GAP_OCCUPANCY, GAP_ZEROED, GAP_DRIFT, GAP_HALF_STATE)
 
 
 def _next_slip(conn) -> str:
@@ -63,6 +72,124 @@ def _holder(conn, pile_id: int) -> int | None:
         (pile_id,),
     ).fetchone()
     return int(r["id"]) if r else None
+
+
+def _open_gaps(conn, session_id: int) -> list[dict]:
+    return [
+        {"类型": r["gap_type"], "明细": r["detail"], "登记时间": r["created_at"]}
+        for r in conn.execute(
+            "SELECT * FROM abort_gaps WHERE session_id=? AND cleared_at IS NULL ORDER BY id",
+            (session_id,),
+        ).fetchall()
+    ]
+
+
+def _record_gap(conn, session_id: int, gap_type: str, detail: str) -> None:
+    """同类型未清缺口只保留一条，避免对账扫描重复堆叠。"""
+    assert gap_type in GAP_TYPES
+    exists = conn.execute(
+        "SELECT 1 FROM abort_gaps WHERE session_id=? AND gap_type=? AND cleared_at IS NULL",
+        (session_id, gap_type),
+    ).fetchone()
+    if exists:
+        return
+    conn.execute(
+        "INSERT INTO abort_gaps(session_id,gap_type,detail,created_at) VALUES(?,?,?,?)",
+        (session_id, gap_type, detail, now_str()),
+    )
+
+
+def _evaluate_evidence(conn, se) -> list[dict]:
+    """对一笔留过中断记录的会话做证据评估，返回当前仍存在的缺口清单（只读）。
+
+    方案 B：态字允许先落，但枪线释放、残额去向、脉冲电量、终态单态四类证据
+    任何一项不成立，都必须能在此被核出来。
+    """
+    session_id = int(se["id"])
+    gaps: list[dict] = []
+    pile = conn.execute("SELECT status FROM piles WHERE id=?", (se["pile_id"],)).fetchone()
+    gun = conn.execute("SELECT status FROM guns WHERE id=?", (se["gun_id"],)).fetchone()
+    holder = _holder(conn, se["pile_id"])
+    still_occupied = (pile and pile["status"] == "占用") or (gun and gun["status"] == "占用")
+    if holder is None and still_occupied:
+        # 没有后来者接占，桩/枪却仍钉在占用：急停灯与枪线证据撕裂。
+        gaps.append(
+            {
+                "类型": GAP_OCCUPANCY,
+                "明细": f"桩位{pile['status'] if pile else '无'}/枪线{gun['status'] if gun else '无'}仍占用",
+            }
+        )
+
+    kwh = round(float(se["kwh"] or 0), 3)
+    price = float(se["price_locked"] or 0)
+    amount = round(float(se["amount"] or 0), 2)
+    stats = _pulse_stats(conn, session_id)
+    if abs(stats["电量和"] - kwh) >= EPS_KWH:
+        gaps.append(
+            {
+                "类型": GAP_DRIFT,
+                "明细": f"脉冲电量和{stats['电量和']}≠会话电量{kwh}",
+            }
+        )
+    if kwh > 0 and amount == 0:
+        # 有量残额被抹成零：只有“残额作废”事件才允许把有量残额合法清零。
+        voided = conn.execute(
+            "SELECT 1 FROM session_events WHERE session_id=? AND action='残额作废'",
+            (session_id,),
+        ).fetchone()
+        if not voided:
+            gaps.append(
+                {
+                    "类型": GAP_ZEROED,
+                    "明细": f"电量{kwh}非零而残额金额被抹为零，且无残额作废事件",
+                }
+            )
+    if se["status"] not in ("已中断", "已关账"):
+        gaps.append(
+            {
+                "类型": GAP_HALF_STATE,
+                "明细": f"留过中断记录但终态为{se['status']}，态字未收敛",
+            }
+        )
+    return gaps
+
+
+def reconcile_gaps(conn, session_id: int | None = None) -> dict:
+    """缺口对账收口（在写事务内执行）：重新评估证据，证据补齐的缺口核销，
+    仍不成立的保留。返回核销/新增/留存明细。"""
+    if session_id is not None:
+        se = conn.execute(
+            "SELECT * FROM sessions WHERE id=? AND aborted_at IS NOT NULL", (session_id,)
+        ).fetchone()
+        if not se:
+            raise HTTPException(404, detail="会话不存在或无中断记录")
+        targets = [se]
+    else:
+        targets = conn.execute(
+            "SELECT * FROM sessions WHERE aborted_at IS NOT NULL ORDER BY id"
+        ).fetchall()
+
+    cleared, opened, remaining = [], [], 0
+    ts = now_str()
+    for se in targets:
+        sid = int(se["id"])
+        current = {g["类型"]: g["明细"] for g in _evaluate_evidence(conn, se)}
+        rows_open = conn.execute(
+            "SELECT id, gap_type FROM abort_gaps WHERE session_id=? AND cleared_at IS NULL",
+            (sid,),
+        ).fetchall()
+        for r in rows_open:
+            if r["gap_type"] in current:
+                remaining += 1
+            else:
+                conn.execute("UPDATE abort_gaps SET cleared_at=? WHERE id=?", (ts, r["id"]))
+                cleared.append({"会话编号": sid, "类型": r["gap_type"]})
+        for gtype, detail in current.items():
+            if not any(r["gap_type"] == gtype for r in rows_open):
+                _record_gap(conn, sid, gtype, detail)
+                opened.append({"会话编号": sid, "类型": gtype, "明细": detail})
+                remaining += 1
+    return {"已核销": cleared, "新登记": opened, "未清缺口数": remaining}
 
 
 def _release_occupancy(conn, se) -> bool:
@@ -172,6 +299,16 @@ def settle(conn, session_id: int) -> dict:
         # 双保险：已中断但已有收口时间，说明状态与留痕不同步。
         raise HTTPException(409, detail="该中断会话已收口，不可重复结算")
 
+    if se["status"] == "已中断":
+        # 方案 B：缺口未清前冻结急停宣称，关账入口不得吃进存疑残额。
+        gaps = _open_gaps(conn, session_id)
+        if gaps:
+            raise HTTPException(
+            409,
+            detail="该中断会话存在未清可核缺口，残额存疑，禁止收口："
+            + "；".join(f"{g['类型']}（{g['明细']}）" for g in gaps),
+        )
+
     ts = now_str()
     from_abort = se["status"] == "已中断"
     if from_abort:
@@ -180,6 +317,9 @@ def settle(conn, session_id: int) -> dict:
             raise HTTPException(409, detail="中断会话缺少锁定电价，残额无法复算")
         kwh = round(float(se["kwh"]), 3)
         amount = round(kwh * price, 2)
+        if kwh > 0 and amount == 0:
+            # 关账入口再兜一层：抹零残额没有合法去向事件，绝不假绿入账。
+            raise HTTPException(409, detail="有量残额被抹为零且无残额作废事件，禁止收口")
         # 已中断：只收口残额，停止时间沿用中断时间，收口时间另记。
         conn.execute(
             "UPDATE sessions SET status='已关账', amount=?, price_locked=?, settled_at=? WHERE id=?",
@@ -226,7 +366,11 @@ def mark_timeout(conn, session_id: int) -> dict:
 
 
 def abort_session(conn, session_id: int, reason: str = "急停") -> dict:
-    """急停中断：冻结残额 + 释放占用 + 落事件，一步到位；可重放、可幂等重入。"""
+    """急停中断：冻结残额 + 释放占用 + 落事件，全部在同一写事务内。
+
+    方案 B：态字、枪线、残额证据任一步失败即整笔回滚（write_db 兜底），
+    不留半截；证据评估不通过则登记可核缺口并冻结急停宣称。
+    """
     se = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
     if not se:
         raise HTTPException(404, detail="会话不存在")
@@ -234,7 +378,8 @@ def abort_session(conn, session_id: int, reason: str = "急停") -> dict:
     if se["status"] == "已关账":
         raise HTTPException(409, detail="会话已关账，不可中断")
     if se["status"] == "已中断":
-        # 幂等重入：不重复落事件、不改写冻结点，回执按已冻结数据重放。
+        # 幂等重入：不重复落事件、不改写冻结点；先按当前证据重核缺口，再回放回执。
+        reconcile_gaps(conn, session_id)
         return abort_receipt(conn, session_id)
     if se["status"] not in ABORTABLE:
         raise HTTPException(400, detail=f"会话状态为{se['status']}，不可中断")
@@ -266,11 +411,19 @@ def abort_session(conn, session_id: int, reason: str = "急停") -> dict:
         f"（{stats['条数']}条脉冲，脉冲电量和{stats['电量和']}）"
         f"{'，桩位枪线已释放' if released else '，桩位枪线由新会话占用未释放'}",
     )
+
+    # 证据评估：态字已落，但枪线/残额/脉冲/终态不成立的部分必须落成可核缺口。
+    fresh = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    for gap in _evaluate_evidence(conn, fresh):
+        _record_gap(conn, session_id, gap["类型"], gap["明细"])
     return abort_receipt(conn, session_id)
 
 
 def abort_receipt(conn, session_id: int) -> dict:
-    """中断回执：全部字段由已落库状态复算，可独立重放核对。"""
+    """中断回执：全部字段由已落库状态复算，可独立重放核对。
+
+    急停宣称只在“无未清缺口”时成立；缺口未清，回执绿灯必须熄灭。
+    """
     se = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
     if not se:
         raise HTTPException(404, detail="会话不存在")
@@ -286,6 +439,7 @@ def abort_receipt(conn, session_id: int) -> dict:
     gun = conn.execute("SELECT status FROM guns WHERE id=?", (se["gun_id"],)).fetchone()
     holder = _holder(conn, se["pile_id"])
     self_holding = holder == session_id
+    gaps = _open_gaps(conn, session_id)
     events = [
         {
             "编号": e["id"],
@@ -318,13 +472,17 @@ def abort_receipt(conn, session_id: int) -> dict:
             "已收口": bool(se["settled_at"]),
             "收口时间": se["settled_at"],
             "待收口": se["status"] == "已中断",
+            "收口冻结": len(gaps) > 0,
         },
+        "缺口": gaps,
+        "急停宣称": len(gaps) == 0,
         "对账": {
             "脉冲电量和相符": abs(stats["电量和"] - kwh) < EPS_KWH,
             "残额可复算": abs(recomputed - amount) < EPS_AMOUNT,
             "冻结金额": amount,
             "复算金额": recomputed,
             "单态": se["status"] in ("已中断", "已关账"),
+            "无未清缺口": len(gaps) == 0,
         },
         "事件": events,
     }
@@ -344,16 +502,23 @@ def list_aborted(conn) -> list[dict]:
     out = []
     for se in rs:
         d = {k: se[k] for k in se.keys()}
+        gaps = _open_gaps(conn, se["id"])
         d["待收口"] = se["status"] == "已中断" and not se["settled_at"]
+        d["未清缺口"] = gaps
+        d["缺口数"] = len(gaps)
+        d["急停宣称"] = len(gaps) == 0
         out.append(d)
     return out
 
 
 def abort_audit(conn) -> dict:
-    """全局中断对账：把“已中断仍占枪、残额被清零、半截双态”暴露成清单。"""
+    """全局中断对账：把“已中断仍占枪、残额被清零、半截双态、漂移”暴露成清单，
+    并与持久化的可核缺口（abort_gaps）同命运——先对账收口，再汇总未清缺口。"""
+    reconcile_gaps(conn)
     bad_occupancy: list[dict] = []
     zeroed: list[dict] = []
     drifted: list[dict] = []
+    half: list[dict] = []
     aborted = conn.execute(
         "SELECT * FROM sessions WHERE status IN ('已中断','已关账') AND aborted_at IS NOT NULL ORDER BY id"
     ).fetchall()
@@ -392,25 +557,46 @@ def abort_audit(conn) -> dict:
                     "会话电量": kwh,
                 }
             )
-        # 电量非零而残额归零：即便有收口事件，收口本身也不该把有量残额抹成零。
+        # 电量非零而残额归零：无“残额作废”事件即为静默抹零。
         if kwh > 0 and amount == 0:
-            has_close = conn.execute(
-                "SELECT 1 FROM session_events WHERE session_id=? AND action IN ('中断结算收口','结算关账','残额作废')",
+            voided = conn.execute(
+                "SELECT 1 FROM session_events WHERE session_id=? AND action='残额作废'",
                 (se["id"],),
             ).fetchone()
-            zeroed.append(
-                {
-                    "会话编号": se["id"],
-                    "会话号": se["slip_no"],
-                    "电量": kwh,
-                    "有收口事件": bool(has_close),
-                }
-            )
+            if not voided:
+                zeroed.append(
+                    {
+                        "会话编号": se["id"],
+                        "会话号": se["slip_no"],
+                        "电量": kwh,
+                        "有收口事件": bool(
+                            conn.execute(
+                                "SELECT 1 FROM session_events WHERE session_id=? AND action IN ('中断结算收口','结算关账')",
+                                (se["id"],),
+                            ).fetchone()
+                        ),
+                    }
+                )
+        if se["status"] not in ("已中断", "已关账"):
+            half.append({"会话编号": se["id"], "会话号": se["slip_no"], "状态": se["status"]})
+
+    open_gap_rows = conn.execute(
+        """SELECT g.session_id, g.gap_type, g.detail, se.slip_no
+           FROM abort_gaps g JOIN sessions se ON se.id=g.session_id
+           WHERE g.cleared_at IS NULL ORDER BY g.id"""
+    ).fetchall()
+    open_gaps = [
+        {"会话编号": r["session_id"], "会话号": r["slip_no"], "类型": r["gap_type"], "明细": r["detail"]}
+        for r in open_gap_rows
+    ]
     return {
         "已中断仍占用": bad_occupancy,
         "残额静默清零": zeroed,
         "脉冲与电量漂移": drifted,
-        "合计问题": len(bad_occupancy) + len(zeroed) + len(drifted),
+        "中断态半截": half,
+        "未清缺口": open_gaps,
+        "未清缺口数": len(open_gaps),
+        "合计问题": len(bad_occupancy) + len(zeroed) + len(drifted) + len(half),
     }
 
 
@@ -431,11 +617,3 @@ def set_pile_status(conn, pile_id: int, status: str) -> dict:
         raise HTTPException(400, detail="仍有在充会话，不可改空闲")
     conn.execute("UPDATE piles SET status=? WHERE id=?", (status, pile_id))
     return {"桩位编号": pile_id, "状态": status}
-
-_abort_session_impl = abort_session
-
-
-def abort_session(*args, **kwargs):
-    out = _abort_session_impl(*args, **kwargs)
-    return abort_surface.after_abort(args[0] if args else None, out, *args[1:], **kwargs)
-

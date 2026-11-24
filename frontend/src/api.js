@@ -35,6 +35,8 @@ export const api = {
   中断回执: (id) => req(`/会话/${id}/中断回执`),
   中断对账: () => req('/中断对账'),
   中断会话: () => req('/中断会话'),
+  缺口对账: (会话编号 = null) =>
+    req('/缺口对账', { method: 'POST', body: JSON.stringify({ 会话编号 }) }),
   充日: () => req('/充日'),
   封印: (备注 = '') => req('/充日/封印', { method: 'POST', body: JSON.stringify({ 备注 }) }),
   解封: () => req('/充日/解封', { method: 'POST', body: '{}' }),

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 
-const surface_panel = true
 export default function Sessions() {
   const [list, setList] = useState([])
   const [detail, setDetail] = useState(null)
@@ -39,7 +38,7 @@ export default function Sessions() {
   }
 
   return (
-    <div className={surface_panel ? "page" : "page"}>
+    <div className="page">
       <h2>会话册</h2>
       <p className="lead">最近会话列表；点开可看脉冲与事件流水，中断会话可重放残额对账。</p>
       <div className="panel">
@@ -90,14 +89,45 @@ export default function Sessions() {
           </p>
           {detail.中断 && (
             <div className="panel" style={{ background: 'var(--panel2)' }}>
-              <h3>中断残额</h3>
+              <h3>
+                中断残额 ·{' '}
+                {detail.急停宣称 ? (
+                  <span className="tag 已关账">急停宣称成立</span>
+                ) : (
+                  <span className="tag 已中断">急停宣称冻结</span>
+                )}
+              </h3>
               <p>
                 时间 {detail.中断.时间} · 原因 {detail.中断.原因} · 冻结 电量{' '}
                 {detail.中断.残额.电量} × 单价 {detail.中断.残额.单价} = 金额{' '}
                 {detail.中断.残额.金额}
               </p>
+              {!!detail.未清缺口?.length && (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>未清缺口类型</th>
+                      <th>明细</th>
+                      <th>登记时间</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {detail.未清缺口.map((g, i) => (
+                      <tr key={i}>
+                        <td style={{ color: 'var(--danger)' }}>{g.类型}</td>
+                        <td>{g.明细}</td>
+                        <td>{g.登记时间}</td>
+                    </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
               <p className={detail.回执?.对账?.残额可复算 ? 'ok' : 'msg'}>
-                {detail.中断.待收口 ? '待收口（可在结算页收口一次）' : `已收口于 ${detail.中断.收口时间}`}
+                {detail.中断.待收口
+                  ? detail.未清缺口?.length
+                    ? '缺口未清，收口冻结'
+                    : '待收口（可在结算页收口一次）'
+                  : `已收口于 ${detail.中断.收口时间}`}
                 ；回执复算 {detail.回执?.对账?.复算金额}，脉冲电量和相符{' '}
                 {detail.回执?.对账?.脉冲电量和相符 ? '是' : '否'}
               </p>

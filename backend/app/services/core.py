@@ -1,6 +1,5 @@
 from __future__ import annotations
 from datetime import datetime, timedelta
-from app.services import abort_surface
 
 from app.db import db, row_dict, rows
 
@@ -61,6 +60,13 @@ def overview(conn) -> dict:
                   COALESCE(SUM(CASE WHEN settled_at IS NULL THEN 1 ELSE 0 END),0) AS pending
            FROM sessions WHERE status='已中断'"""
     ).fetchone()
+    # 方案 B：未清可核缺口计数。缺口未清，已中断桶不许亮“齐”。
+    open_gaps = conn.execute(
+        "SELECT COUNT(*) AS n FROM abort_gaps WHERE cleared_at IS NULL"
+    ).fetchone()["n"]
+    gap_sessions = conn.execute(
+        """SELECT COUNT(DISTINCT session_id) AS n FROM abort_gaps WHERE cleared_at IS NULL"""
+    ).fetchone()["n"]
     return {
         "桩位空闲": pile_map.get("空闲", 0),
         "桩位占用": pile_map.get("占用", 0),
@@ -74,6 +80,9 @@ def overview(conn) -> dict:
         "已中断待收口": int(aborted["pending"]),
         "已中断残额电量": round(float(aborted["k"]), 3),
         "已中断残额金额": round(float(aborted["a"]), 2),
+        "未清缺口数": int(open_gaps),
+        "缺口会话数": int(gap_sessions),
+        "已中断齐": int(open_gaps) == 0,
         "在充电量": round(float(open_kwh), 3),
         "本日关账金额": round(float(today_amount), 2),
         "营业日": today(),
@@ -143,7 +152,19 @@ def list_sessions(conn, status: str | None = None):
                JOIN sites s ON s.id=se.site_id
                ORDER BY se.id DESC LIMIT 200"""
         ).fetchall()
-    return rows(rs)
+    out = rows(rs)
+    # 列表与中断页/总览同源带上缺口计数，结算入口据此冻结收口按钮。
+    gap_counts = {
+        int(r["session_id"]): int(r["n"])
+        for r in conn.execute(
+            "SELECT session_id, COUNT(*) AS n FROM abort_gaps WHERE cleared_at IS NULL GROUP BY session_id"
+        ).fetchall()
+    }
+    for d in out:
+        n = gap_counts.get(int(d["id"]), 0)
+        d["缺口数"] = n
+        d["急停宣称"] = (n == 0) if d.get("aborted_at") else False
+    return out
 
 
 def session_detail(conn, session_id: int):
@@ -176,6 +197,16 @@ def session_detail(conn, session_id: int):
     d["可结算"] = se["status"] in ("充电中", "结算中", "已超时", "已中断")
     d["可中断"] = se["status"] in ("充电中", "结算中", "已超时")
     if se["aborted_at"]:
+        # 详情页与中断页/回执同源，不另算一套残额；缺口也同源读取，禁止展示层另判。
+        gaps = [
+            {"类型": r["gap_type"], "明细": r["detail"], "登记时间": r["created_at"]}
+            for r in conn.execute(
+                "SELECT * FROM abort_gaps WHERE session_id=? AND cleared_at IS NULL ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        ]
+        d["未清缺口"] = gaps
+        d["急停宣称"] = len(gaps) == 0
         # 详情页与中断页/回执同源，不另算一套残额。
         d["中断"] = {
             "时间": se["aborted_at"],
@@ -187,14 +218,12 @@ def session_detail(conn, session_id: int):
             },
             "待收口": se["status"] == "已中断",
             "收口时间": se["settled_at"],
+            "未清缺口": gaps,
+            "急停宣称": len(gaps) == 0,
         }
     else:
         d["中断"] = None
+        d["未清缺口"] = []
+        d["急停宣称"] = False
     return d
-
-_overview_impl = overview
-
-
-def overview(conn):
-    return abort_surface.overlay_overview(_overview_impl(conn), conn)
 

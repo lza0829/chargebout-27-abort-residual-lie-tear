@@ -22,6 +22,10 @@ class AbortIn(BaseModel):
     原因: str = "急停"
 
 
+class GapReconcileIn(BaseModel):
+    会话编号: int | None = None
+
+
 @router.get("/会话")
 def list_sessions(状态: str | None = None):
     with db() as conn:
@@ -30,7 +34,8 @@ def list_sessions(状态: str | None = None):
 
 @router.get("/中断对账")
 def abort_audit():
-    with db() as conn:
+    # 对账会核销/登记可核缺口（写），必须走 BEGIN IMMEDIATE 写事务。
+    with write_db() as conn:
         return svc.abort_audit(conn)
 
 
@@ -85,6 +90,11 @@ def abort(session_id: int, body: AbortIn | None = None):
         reason = body.原因 if body else "急停"
         return svc.abort_session(conn, session_id, reason)
 
-def _surface_router_sessions() -> dict:
-    return {"panel": "sessions", "ready": True}
+
+@router.post("/缺口对账")
+def reconcile_gaps(body: GapReconcileIn | None = None):
+    """缺口对账收口：重评证据，补齐的核销、不成立的保留；可只核单会话。"""
+    with write_db() as conn:
+        sid = body.会话编号 if body else None
+        return svc.reconcile_gaps(conn, sid)
 

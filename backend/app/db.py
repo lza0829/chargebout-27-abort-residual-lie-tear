@@ -80,6 +80,17 @@ CREATE TABLE IF NOT EXISTS session_events (
   note TEXT NOT NULL DEFAULT '',
   FOREIGN KEY(session_id) REFERENCES sessions(id)
 );
+-- 方案 B 的可核缺口：枪线/残额/脉冲/半截态任一证据不齐，就在写事务内落一条；
+-- cleared_at 为 NULL 表示缺口未清，急停宣称冻结、禁止收口。
+CREATE TABLE IF NOT EXISTS abort_gaps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL,
+  gap_type TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  cleared_at TEXT,
+  FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
 CREATE TABLE IF NOT EXISTS day_seals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   business_day TEXT NOT NULL UNIQUE,
@@ -99,6 +110,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_pile ON sessions(pile_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_gun ON sessions(gun_id);
 CREATE INDEX IF NOT EXISTS idx_pulses_session ON pulses(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_session ON session_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_gaps_session ON abort_gaps(session_id);
 """
 
 # 旧库迁移：CREATE TABLE IF NOT EXISTS 不会补列。
@@ -172,6 +184,10 @@ def init_db() -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         _migrate(conn)
+        # 清掉旧旁路（abort_surface）写下的假快照与毒标记：总览只许由事实表重算。
+        conn.execute(
+            "DELETE FROM settings WHERE key='surface_last' OR key='surface_ok' OR key LIKE 'abort_surface:%'"
+        )
     finally:
         conn.close()
 

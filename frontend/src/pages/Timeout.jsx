@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api'
 
-const surface_panel = true
 export default function Timeout() {
   const [list, setList] = useState([])
   const [msg, setMsg] = useState('')
@@ -20,7 +19,7 @@ export default function Timeout() {
     }
   }
   return (
-    <div className={surface_panel ? "page" : "page"}>
+    <div className="page">
       <h2>超时标记</h2>
       <p className="lead">
         对充电中会话标超时；急停中断请走{' '}
